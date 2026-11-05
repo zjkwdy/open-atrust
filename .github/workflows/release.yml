@@ -1,15 +1,22 @@
 # 打 tag（形如 v1.0.0）→ 交叉编译各平台二进制 → 每个平台与示例配置打成 zip → 上传到该 tag 的 Release。
 #
-# 平台：windows/386、windows/amd64、linux/386、linux/amd64、
-#       linux/arm64（ARMv8-A 的 AArch64 64 位执行态，现代手机即 Android arm64-v8a）、
-#       linux/arm + GOARM=7（AArch32 32 位，ARMv8 芯片也能跑，用于 32 位系统/老设备）
-# 项目 0 外部依赖（go.mod 里没有任何 require），所以 CGO_ENABLED=0 交叉编译即可得到静态单文件。
+# 两类目标：
+#   A) 静态交叉编译（CGO_ENABLED=0）：windows/linux 的 386、amd64，linux/arm64、linux/arm(v7)。
+#      项目 0 外部依赖（go.mod 无 require），产物是静态单文件，任何 Linux 上直接跑。
+#   B) Android 专用（CGO_ENABLED=1 + Android NDK）：android/arm64、android/arm(v7)、android/amd64。
+#      Android 没有 /etc/resolv.conf，Go 纯 Go 解析器找不到 DNS 服务器，静态包在 Termux 里会报
+#      "lookup ... on [::1]:53: read: connection refused"。用 NDK 编进 cgo 后，GOOS=android 时
+#      Go 优先走 cgo 解析器（net/conf.go: goosPrefersCgo），域名解析交给 bionic 的 getaddrinfo，
+#      才和 Termux 里本机编译的效果一致。产物是动态链接 bionic 的 PIE（Android 7.0 / API 24 起）。
 name: Release
 
 on:
   push:
     tags:
       - "v*"
+  # 手动跑一次：只编译并产出 workflow artifact，不会创建 Release（release 任务有 tag 判断），
+  # 用来在正式打 tag 前先验证 NDK 那条腿能不能过。
+  workflow_dispatch:
 
 # 同一个 tag 被重复推送（例如强制重打）时串行执行，避免两次运行同时写 Release。
 concurrency:
@@ -17,9 +24,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CGO_ENABLED: "0"
+  CGO_ENABLED: "0" # Android 任务在命令行上单独改成 1
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # A) 静态单文件：不依赖目标系统 libc，装到哪都能跑
+  # ---------------------------------------------------------------------------
   build:
     name: build ${{ matrix.goos }}/${{ matrix.goarch }}
     runs-on: ubuntu-latest
@@ -38,8 +48,8 @@ jobs:
           - goos: linux
             goarch: amd64
           - goos: linux
-            goarch: arm64 # ARMv8 的 64 位 AArch64：现代手机（Termux arm64）用这个
-          # ARM 32 位：GOARM=7 即 AArch32 / armv7，跑在 ARMv8 芯片上也行，但只有 32 位
+            goarch: arm64 # ARMv8 的 64 位 AArch64；通用 Linux（树莓派 64 位等），不是 Android 专用包
+          # ARM 32 位：GOARM=7 即 AArch32 / armv7；
           - goos: linux
             goarch: arm
             goarm: "7"
@@ -100,9 +110,111 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # ---------------------------------------------------------------------------
+  # B) Android 专用：NDK + cgo，域名解析走系统解析器（bionic getaddrinfo）
+  # ---------------------------------------------------------------------------
+  build-android:
+    name: build android (NDK)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      NDK_VERSION: r25c # 与 go.mod 的 Go 1.20 同期，最稳；升级 Go 后可换 r26/r27
+      NDK_API: "24"     # Android 7.0；Termux 也要求 API 24+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install Android NDK
+        id: ndk
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk_root="${RUNNER_TEMP}/android-ndk-${NDK_VERSION}"
+          toolchain="${ndk_root}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          probe="${toolchain}/aarch64-linux-android${NDK_API}-clang"
+          if [ ! -x "${probe}" ]; then
+            echo "downloading Android NDK ${NDK_VERSION} ..."
+            zip_path="${RUNNER_TEMP}/android-ndk-${NDK_VERSION}-linux.zip"
+            curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 \
+              -o "${zip_path}" \
+              "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+            rm -rf "${ndk_root}"
+            unzip -q "${zip_path}" -d "${RUNNER_TEMP}"
+            rm -f "${zip_path}"
+          fi
+          test -x "${probe}"
+          echo "NDK_HOME=${ndk_root}" >> "${GITHUB_ENV}"
+          echo "NDK_TOOLCHAIN=${toolchain}" >> "${GITHUB_ENV}"
+          echo "using NDK: ${ndk_root}"
+          go version
+
+      - name: Build and package (cgo, PIE)
+        id: pkg
+        shell: bash
+        env:
+          GOOS: android
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          mkdir -p dist
+
+          # 架构 | GOARM | 文件名后缀 | NDK clang 包装器
+          targets=(
+            "arm64||arm64|aarch64-linux-android${NDK_API}-clang"
+            "arm|7|armv7|armv7a-linux-androideabi${NDK_API}-clang"
+            "amd64||x86_64|x86_64-linux-android${NDK_API}-clang"
+          )
+
+          for entry in "${targets[@]}"; do
+            IFS='|' read -r goarch goarm label cc_name <<< "${entry}"
+            cc="${NDK_TOOLCHAIN}/${cc_name}"
+            if [ ! -x "${cc}" ]; then
+              echo "::error::missing NDK compiler: ${cc}"
+              exit 1
+            fi
+
+            name="atrust-proxy_${tag}_android_${label}"
+            stage="${RUNNER_TEMP}/${name}"
+            rm -rf "${stage}"
+            mkdir -p "${stage}"
+            echo "building ${name}: GOARCH=${goarch} GOARM=${goarm:-<none>} CC=${cc_name}"
+
+            # GOOS=android 会让 Go 走 cgo 解析器；-buildmode=pie 是 Android 可执行文件的默认要求
+            GOOS=android GOARCH="${goarch}" GOARM="${goarm}" \
+              CGO_ENABLED=1 CC="${cc}" \
+              go build -buildmode=pie -trimpath -ldflags="-s -w" \
+              -o "${stage}/atrust-proxy" .
+
+            cp config.example.json LICENSE.md "${stage}/"
+            ( cd "${stage}" && zip -9 -X "${GITHUB_WORKSPACE}/dist/${name}.zip" \
+                atrust-proxy config.example.json LICENSE.md )
+            echo "built: ${name}.zip"
+          done
+
+          ls -lh dist/
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-packages
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 发布：只在 tag 上创建/更新 Release，避免手动触发的分支运行污染 Releases
+  # ---------------------------------------------------------------------------
   release:
     name: publish release
-    needs: build
+    needs: [build, build-android]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write # 创建/更新 Release、上传资产：用仓库内置 GITHUB_TOKEN，不需要自建 secret
@@ -135,20 +247,28 @@ jobs:
 
             产物命名：`atrust-proxy_<tag>_<系统>_<架构>.zip`，按你的平台选一个：
 
-            | 平台 | 架构 | 压缩包 |
-            | --- | --- | --- |
-            | Windows | x86（32 位） | `..._windows_386.zip` |
-            | Windows | x86_64 | `..._windows_amd64.zip` |
-            | Linux | x86（32 位） | `..._linux_386.zip` |
-            | Linux | x86_64 | `..._linux_amd64.zip` |
-            | Linux | ARM64（手机 Termux / 树莓派 64 位） | `..._linux_arm64.zip` |
-            | Linux | ARMv7（32 位 Android / 树莓派 32 位） | `..._linux_armv7.zip` |
+            | 平台 | 架构 | 压缩包 | 说明 |
+            | --- | --- | --- | --- |
+            | Windows | x86（32 位） | `..._windows_386.zip` | 静态单文件 |
+            | Windows | x86_64 | `..._windows_amd64.zip` | 静态单文件 |
+            | Linux | x86（32 位） | `..._linux_386.zip` | 静态单文件 |
+            | Linux | x86_64 | `..._linux_amd64.zip` | 静态单文件 |
+            | Linux | ARM64 | `..._linux_arm64.zip` | 静态单文件，通用 Linux（树莓派 64 位等） |
+            | Linux | ARMv7 | `..._linux_armv7.zip` | 静态单文件，通用 Linux 32 位 ARM |
+            | Android | ARM64 | `..._android_arm64.zip` | 手机首选（Termux arm64） |
+            | Android | ARMv7 | `..._android_armv7.zip` | 32 位 Android / Termux |
+            | Android | x86_64 | `..._android_x86_64.zip` | 模拟器 / WSA |
+
+            > **手机（Android/Termux）请用 `android_*` 包。**
+            > Android 上没有 `/etc/resolv.conf`，静态版（`linux_*`）能启动但域名解析会失败
+            > （`lookup ... [::1]:53: connection refused`）。`android_*` 用 Android NDK 编译、
+            > 走系统解析器，域名解析正常；代价是依赖系统 bionic，要求 Android 7.0（API 24）及以上。
 
             每个压缩包内是：
 
             | 文件 | 说明 |
             | --- | --- |
-            | `atrust-proxy` / `atrust-proxy.exe` | 主程序，静态单文件，0 外部依赖 |
+            | `atrust-proxy` / `atrust-proxy.exe` | 主程序；`linux_*`、`windows_*` 为静态单文件，`android_*` 动态链接 bionic |
             | `config.example.json` | 示例配置，复制成 `config.json` 后填账号密码 |
             | `LICENSE.md` | GPL-3.0 |
 

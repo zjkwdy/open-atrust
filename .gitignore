@@ -4,6 +4,9 @@ atrust-proxy
 atrust-proxy.old
 atrustproxy
 atrustproxy-linux-*
+# 本地跑 workflow 打包脚本留下的中间目录/压缩包（内含 config.json 副本，别提交）
+atrust-proxy_v*/
+atrust-proxy_v*.zip
 *.exe
 *.test
 *.out
