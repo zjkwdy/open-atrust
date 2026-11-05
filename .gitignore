@@ -1,0 +1,43 @@
+# 构建产物
+atrust-proxy.exe
+atrust-proxy
+atrust-proxy.old
+atrustproxy
+atrustproxy-linux-*
+*.exe
+*.test
+*.out
+
+# 本地配置（含账号密码，只保留示例）
+config.json
+config.*.json
+config.json.bak
+*.bak
+!config.example.json
+
+# 设备身份与网关 cookie（程序自动生成，等价设备指纹）
+config.state.json
+*.state.json
+*.cookies.json
+*cookies*.json
+
+# 运行期产物
+*.log
+*.jsonl
+ruleset/
+*.yaml.tmp
+*.tmp
+
+# 抓包 / 转储 / 逆向中间产物
+*.pcap
+*.pcapng
+*.bin
+*.dmp
+dump-*.txt
+
+# 编辑器与系统
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

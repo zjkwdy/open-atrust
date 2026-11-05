@@ -1,0 +1,174 @@
+# 打 tag（形如 v1.0.0）→ 交叉编译各平台二进制 → 每个平台与示例配置打成 zip → 上传到该 tag 的 Release。
+#
+# 平台：windows/386、windows/amd64、linux/386、linux/amd64、
+#       linux/arm64（ARMv8-A 的 AArch64 64 位执行态，现代手机即 Android arm64-v8a）、
+#       linux/arm + GOARM=7（AArch32 32 位，ARMv8 芯片也能跑，用于 32 位系统/老设备）
+# 项目 0 外部依赖（go.mod 里没有任何 require），所以 CGO_ENABLED=0 交叉编译即可得到静态单文件。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# 同一个 tag 被重复推送（例如强制重打）时串行执行，避免两次运行同时写 Release。
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # 构建只需要读代码
+    strategy:
+      fail-fast: false # 一个平台失败时不要取消其他平台，方便一次看全
+      matrix:
+        include:
+          - goos: windows
+            goarch: "386"
+          - goos: windows
+            goarch: amd64
+          - goos: linux
+            goarch: "386"
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64 # ARMv8 的 64 位 AArch64：现代手机（Termux arm64）用这个
+          # ARM 32 位：GOARM=7 即 AArch32 / armv7，跑在 ARMv8 芯片上也行，但只有 32 位
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod # 以 go.mod 的 go 指令为唯一版本来源
+          cache: false # 没有 go.sum（无第三方依赖），缓存没有意义
+
+      - name: Build and package
+        id: pkg
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"                  # 例如 v1.0.0
+          ext=""
+          if [ "${GOOS}" = "windows" ]; then
+            ext=".exe"
+          fi
+          # ARM 32 位才有 GOARM；其余平台该变量为空。用 ${VAR:-} 写法保证 set -u 下也安全。
+          arm_suffix=""
+          if [ -n "${GOARM:-}" ]; then
+            arm_suffix="v${GOARM}"
+          fi
+          arch="${GOARCH}${arm_suffix}"             # amd64 / 386 / arm64 / armv7
+          name="atrust-proxy_${tag}_${GOOS}_${arch}"
+          stage="${RUNNER_TEMP}/${name}"
+          echo "target: GOOS=${GOOS} GOARCH=${GOARCH} GOARM=${GOARM:-<none>} -> ${name}"
+
+          # 1) 交叉编译（带 -trimpath -s -w：路径不进二进制、体积最小）
+          mkdir -p "${stage}"
+          go build -trimpath -ldflags="-s -w" -o "${stage}/atrust-proxy${ext}" .
+
+          # 2) 示例配置 + 许可证（GPL-3.0 分发二进制时需随附许可证）
+          cp config.example.json LICENSE.md "${stage}/"
+
+          # 3) 压缩包内文件放在根目录：解压后直接 ./atrust-proxy config.json 就能跑
+          mkdir -p dist
+          ( cd "${stage}" && zip -9 -X "${GITHUB_WORKSPACE}/dist/${name}.zip" \
+              "atrust-proxy${ext}" config.example.json LICENSE.md )
+
+          echo "artifact=${name}.zip" >> "${GITHUB_OUTPUT}"
+          echo "built: ${name}.zip"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.artifact }}
+          path: dist/${{ steps.pkg.outputs.artifact }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 创建/更新 Release、上传资产：用仓库内置 GITHUB_TOKEN，不需要自建 secret
+    steps:
+      - name: Download all platform archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.zip | LC_ALL=C sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          overwrite_files: true # 同一个 tag 重跑时覆盖旧资产
+          body: |
+            ## 下载
+
+            产物命名：`atrust-proxy_<tag>_<系统>_<架构>.zip`，按你的平台选一个：
+
+            | 平台 | 架构 | 压缩包 |
+            | --- | --- | --- |
+            | Windows | x86（32 位） | `..._windows_386.zip` |
+            | Windows | x86_64 | `..._windows_amd64.zip` |
+            | Linux | x86（32 位） | `..._linux_386.zip` |
+            | Linux | x86_64 | `..._linux_amd64.zip` |
+            | Linux | ARM64（手机 Termux / 树莓派 64 位） | `..._linux_arm64.zip` |
+            | Linux | ARMv7（32 位 Android / 树莓派 32 位） | `..._linux_armv7.zip` |
+
+            每个压缩包内是：
+
+            | 文件 | 说明 |
+            | --- | --- |
+            | `atrust-proxy` / `atrust-proxy.exe` | 主程序，静态单文件，0 外部依赖 |
+            | `config.example.json` | 示例配置，复制成 `config.json` 后填账号密码 |
+            | `LICENSE.md` | GPL-3.0 |
+
+            ## 使用
+
+            ```bash
+            cp config.example.json config.json
+            # 填 user / password；gateway / sni 保持默认
+            ./atrust-proxy config.json
+            ```
+
+            首次登录需要过验证码时，浏览器打开 http://127.0.0.1:18085/
+
+            手机上（Termux）解压后如果丢了执行权限：`chmod +x ./atrust-proxy`。
+
+            ## 校验
+
+            下载同页的 `SHA256SUMS` 后：`sha256sum -c SHA256SUMS`。
+
+            > 仅用于你本人已授权的账号与设备。
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS

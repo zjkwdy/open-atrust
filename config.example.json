@@ -1,0 +1,13 @@
+{
+  "listen": "127.0.0.1:10080",
+  "gateway": "221.203.22.52:441",
+  "sni": "vpn.ustl.edu.cn",
+  "user": "<学号/工号>",
+  "password": "<密码>",
+  "appId": "auto",
+  "lang": "zh-CN",
+  "loginListen": "127.0.0.1:18085",
+  "ruleListen": "127.0.0.1:18090",
+  "ruleName": "aTrust",
+  "verbose": true
+}
