@@ -55,7 +55,7 @@ curl -x socks5h://127.0.0.1:10080 -vvL http://opac.ustl.edu.cn:8080/
   "listen": "127.0.0.1:10080",
   "gateway": "221.203.22.52:441",
   "sni": "vpn.ustl.edu.cn",
-  "user": "120253502083",
+  "user": "<学号/工号>",
   "password": "<你的密码>",
   "appId": "auto",
   "lang": "zh-CN",
@@ -107,7 +107,7 @@ curl -x socks5h://127.0.0.1:10080 -vvL http://opac.ustl.edu.cn:8080/
 
 1. 注入一个指向本程序的 SOCKS5 节点 `USTL`；
 2. 建一个 `USTL-Group` 选择组（`USTL` / `DIRECT`）；
-3. 注册 rule-provider `atrust`（每小时拉一次）；
+3. 注册 rule-provider `atrust`（每小时拉一次）；延迟测试链接是内网才能访问的图书馆查书目录；
 4. 把 `RULE-SET,atrust,USTL-Group` 插到规则最顶端。
 
 ```javascript
@@ -133,6 +133,7 @@ function main(config, profileName) {
   const newGroup = {
     name: "USTL-Group",
     type: "select",
+    url: "http://opac.ustl.edu.cn:8080/",
     proxies: ["USTL", "DIRECT"]
   };
   config['proxy-groups'] = config['proxy-groups'].filter(g => g.name !== "USTL-Group");
